@@ -1,0 +1,116 @@
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Local GitLab CE + GitLab Runner for the AI-native SDLC demo.
+#
+# RESOURCE NOTES (read before `up`):
+#   - GitLab CE alone needs ~4GB+ RAM (it runs Postgres, Redis, Puma, Sidekiq,
+#     Gitaly and nginx in one container), even with the minimal-footprint
+#     tuning below.
+#   - To run GitLab + a trimmed opentelemetry-demo stack side by side, give
+#     Docker Desktop (or your engine) 12GB+ of memory and 4+ CPUs.
+#   - First boot takes 3-5+ minutes before the healthcheck goes green.
+#
+# IMAGE PINNING:
+#   Both images are pinned instead of :latest so the demo is reproducible and
+#   so the bootstrap script's runner-creation flow (POST /api/v4/user/runners,
+#   introduced in GitLab 16.0) is guaranteed to exist. 18.2.x is a recent
+#   stable release line; bump both tags together when upgrading.
+
+name: gitlab-ai-sdlc
+
+services:
+  gitlab:
+    image: gitlab/gitlab-ce:18.2.1-ce.0
+    container_name: gitlab
+    # Container hostname; on the compose network the service is reachable as
+    # "gitlab" (used by the runner and by CI job containers via clone_url).
+    hostname: gitlab
+    restart: unless-stopped
+    shm_size: "256m"
+    ports:
+      # Web/API/HTTP-git. external_url is set to http://localhost:8929 below so
+      # that the clone URLs GitLab renders in its UI work verbatim on the host.
+      - "8929:8929"
+      # SSH-git (container sshd listens on 22; host port 2224 avoids clashes).
+      - "2224:22"
+    environment:
+      # DEMO-ONLY password. Override by exporting GITLAB_ROOT_PASSWORD before
+      # `docker compose up`. Never reuse a real credential here. GitLab only
+      # honors initial_root_password on the very first boot (empty data volume).
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://localhost:8929'
+        gitlab_rails['gitlab_shell_ssh_port'] = 2224
+        gitlab_rails['initial_root_password'] = '${GITLAB_ROOT_PASSWORD:-demopassword123!}'
+        # --- Minimal-footprint tuning (standard omnibus memory-constrained set) ---
+        # Disable the bundled Prometheus monitoring stack (exporters, alertmanager).
+        prometheus_monitoring['enable'] = false
+        # Puma: single worker ("clusterless" mode) saves ~1GB.
+        puma['worker_processes'] = 0
+        # Sidekiq: one process, low concurrency.
+        sidekiq['max_concurrency'] = 10
+        # Not needed for the demo: container registry, KAS (k8s agent), pages, mattermost.
+        registry['enable'] = false
+        gitlab_kas['enable'] = false
+        gitlab_pages['enable'] = false
+        mattermost['enable'] = false
+        # Reduce gitaly + rails memory pressure a bit.
+        gitlab_rails['env'] = { 'MALLOC_ARENA_MAX' => '2' }
+    volumes:
+      - gitlab-config:/etc/gitlab
+      - gitlab-logs:/var/log/gitlab
+      - gitlab-data:/var/opt/gitlab
+    healthcheck:
+      # Readiness endpoint; nginx listens on 8929 inside the container because
+      # external_url carries that port.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8929/-/readiness"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 6m
+    networks:
+      - gitlab
+
+  gitlab-runner:
+    image: gitlab/gitlab-runner:v18.2.1
+    container_name: gitlab-runner
+    restart: unless-stopped
+    depends_on:
+      gitlab:
+        condition: service_healthy
+    volumes:
+      # Docker executor: job containers are siblings on the host engine.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - gitlab-runner-config:/etc/gitlab-runner
+    networks:
+      - gitlab
+
+volumes:
+  gitlab-config:
+  gitlab-logs:
+  gitlab-data:
+  gitlab-runner-config:
+
+networks:
+  # Dedicated network for the GitLab stack. CI job containers are attached to
+  # it too (bootstrap registers the runner with --docker-network-mode gitlab),
+  # so jobs can reach GitLab at http://gitlab:8929.
+  gitlab:
+    name: gitlab
+    driver: bridge
+  # --- Bridging with the opentelemetry-demo stack -------------------------
+  # The root docker-compose.yml of this repo creates a bridge network named
+  # "opentelemetry-demo". To let demo narratives span both stacks (e.g. a CI
+  # job or GitLab webhook reaching the running shop, or you curl-ing services
+  # from a job), EITHER:
+  #   1. After both stacks are up, connect the containers you need:
+  #        docker network connect opentelemetry-demo gitlab
+  #        docker network connect opentelemetry-demo gitlab-runner
+  #   2. Or uncomment the external network below and add
+  #        "- opentelemetry-demo" to each service's networks list.
+  #      (Left commented out so this file stands alone when the shop stack
+  #      is not running; external networks must already exist at `up` time.)
+  #
+  # opentelemetry-demo:
+  #   name: opentelemetry-demo
+  #   external: true

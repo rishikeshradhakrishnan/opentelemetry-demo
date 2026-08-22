@@ -1,0 +1,232 @@
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# AI-native SDLC demo pipeline (see demo/gitlab/README.md).
+#
+# NOTE: This file is only consumed by the LOCAL GitLab instance the demo
+# bootstraps (demo/gitlab/). It is inert on GitHub — GitHub Actions ignores it.
+#
+# Stage mapping to the AI-Native SDLC playbook
+# (https://claude.com/blog/the-ai-native-sdlc-playbook — plan/design/build/
+# test/deploy/maintain as a loop of automatically-triggered plays):
+#   lint, test   -> "test" stage plays: fast automated verification gates
+#   build        -> "build/deploy" play: package the service image
+#   ai-review    -> "test/review gate" play: scoped automated review agent on
+#                   every merge request, findings posted as MR notes
+#   ai-autofix   -> "maintain" play: on failure, an agent proposes a fix on a
+#                   branch and opens an MR — the human review gate decides
+#
+# Only two fast, representative services are exercised (payment: Node.js —
+# carries the planted 30% charge-failure bug; quote: PHP — tiny dependency
+# set) so the demo pipeline stays quick. `rules:changes` keeps jobs skipped
+# when their service didn't change.
+#
+# Secrets: ANTHROPIC_API_KEY and GITLAB_TOKEN are CI/CD variables set by
+# demo/gitlab/bootstrap.sh or the GitLab UI. NOTHING secret lives in this file.
+
+stages:
+  - lint
+  - test
+  - build
+  - ai-review
+  - ai-autofix
+
+workflow:
+  rules:
+    # Merge request pipelines (the AI review runs here)...
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    # ...and branch pipelines, except for branches that already have an MR
+    # (avoids duplicate pipelines).
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+# Run a job when its service changed (MR or branch pipeline) or always on the
+# default branch, so the demo branch always shows a full pipeline.
+.payment-rules: &payment-rules
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  - changes:
+      - src/payment/**/*
+      - .gitlab-ci.yml
+
+.quote-rules: &quote-rules
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  - changes:
+      - src/quote/**/*
+      - .gitlab-ci.yml
+
+# ---------------------------------------------------------------------------
+# lint
+# ---------------------------------------------------------------------------
+lint:payment:
+  stage: lint
+  image: node:22-slim
+  rules: *payment-rules
+  script:
+    - echo "Syntax-checking payment service (Node.js)..."
+    - node --check src/payment/index.js
+    - node --check src/payment/charge.js
+    - node --check src/payment/logger.js
+    - node --check src/payment/opentelemetry.js
+
+lint:quote:
+  stage: lint
+  image: composer:2.8
+  rules: *quote-rules
+  script:
+    - echo "Validating quote service (PHP)..."
+    - composer --working-dir=src/quote validate --no-check-publish
+    - find src/quote/src src/quote/public -name '*.php' -print0 | xargs -0 -n1 php -l
+
+# ---------------------------------------------------------------------------
+# test
+# ---------------------------------------------------------------------------
+test:payment:
+  stage: test
+  image: node:22-slim
+  rules: *payment-rules
+  script:
+    - cd src/payment
+    - npm ci
+    # Reliability smoke test: with feature flags stubbed off, a valid charge
+    # must always succeed. The planted hard-coded 30%-failure bug in charge.js
+    # makes this fail (>99.9% of runs) until it is fixed — which is exactly
+    # what the ai-autofix stage then demonstrates.
+    # (no pipe to tee: the shell here has no pipefail, a pipe would mask failure)
+    - node charge.test.js > ../../payment-test.log 2>&1; status=$?; cat ../../payment-test.log; exit $status
+  artifacts:
+    when: on_failure
+    paths:
+      - payment-test.log
+    expire_in: 1 day
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+build:payment:
+  stage: build
+  image: docker:27
+  rules: *payment-rules
+  # The runner mounts /var/run/docker.sock into jobs (see bootstrap.sh), so we
+  # build against the host engine directly — no dind service needed.
+  script:
+    - docker build -f src/payment/Dockerfile -t otel-demo-payment:${CI_COMMIT_SHORT_SHA} .
+    - docker image ls otel-demo-payment:${CI_COMMIT_SHORT_SHA}
+
+# ---------------------------------------------------------------------------
+# ai-review: automated review agent on every merge request
+# ---------------------------------------------------------------------------
+claude-review:
+  stage: ai-review
+  image: node:22 # full image: includes git, needed for the MR diff
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  needs: [] # review runs immediately, in parallel with lint/test/build
+  allow_failure: true # advisory gate: findings inform the human reviewer
+  variables:
+    GIT_DEPTH: "0" # full history so the MR diff base is available
+  script:
+    # Graceful guard: the job explains exactly what is missing and why.
+    - |
+      if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+        echo "ERROR: ANTHROPIC_API_KEY CI/CD variable is not set."
+        echo "Set it under Settings -> CI/CD -> Variables (masked), or export it"
+        echo "before running demo/gitlab/bootstrap.sh. Skipping AI review."
+        exit 1
+      fi
+      if [ -z "${GITLAB_TOKEN:-}" ]; then
+        echo "ERROR: GITLAB_TOKEN CI/CD variable is not set (bootstrap.sh creates it)."
+        echo "Without it, findings cannot be posted as an MR note."
+        exit 1
+      fi
+    - npm install -g @anthropic-ai/claude-code
+    # Diff of this MR against its target branch.
+    - git fetch origin "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}"
+    - git diff "origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}...HEAD" > /tmp/mr.diff
+    - echo "Reviewing $(wc -l < /tmp/mr.diff) diff lines..."
+    # Scoped review agent (playbook: narrow-focus review agents that must
+    # back findings with evidence). -p = non-interactive print mode.
+    - |
+      claude -p "You are an automated merge-request reviewer for the OpenTelemetry \
+      Demo (astronomy shop). Review ONLY the following diff for correctness, \
+      reliability and observability regressions (broken telemetry, swallowed \
+      errors, hard-coded failure injection, secrets). For each finding cite the \
+      file/line as evidence and rate severity (high/medium/low). If the diff is \
+      clean, say so briefly. Output GitLab-flavored markdown.
+
+      $(cat /tmp/mr.diff)" > /tmp/review.md || {
+        echo 'Claude review failed (API error?); see log above.'; exit 1; }
+    - cat /tmp/review.md
+    # Post the findings back on the MR as a note.
+    - |
+      node -e '
+        const fs = require("fs");
+        const body = "## Claude automated review\n\n" + fs.readFileSync("/tmp/review.md", "utf8");
+        fs.writeFileSync("/tmp/note.json", JSON.stringify({ body }));
+      '
+    - |
+      curl -fsS -X POST \
+        --header "PRIVATE-TOKEN: ${GITLAB_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data @/tmp/note.json \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/merge_requests/${CI_MERGE_REQUEST_IID}/notes" > /dev/null
+    - echo "Review posted as an MR note."
+
+# ---------------------------------------------------------------------------
+# ai-autofix: on pipeline failure, an agent proposes a fix on a branch
+# ---------------------------------------------------------------------------
+claude-autofix:
+  stage: ai-autofix
+  image: node:22
+  rules:
+    # Runs only when an earlier stage failed (the "maintain" play trigger);
+    # a human still owns the merge decision on the fix MR it opens.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: on_failure
+    - if: $CI_COMMIT_BRANCH
+      when: on_failure
+  allow_failure: true
+  variables:
+    GIT_DEPTH: "0"
+  script:
+    - |
+      if [ -z "${ANTHROPIC_API_KEY:-}" ] || [ -z "${GITLAB_TOKEN:-}" ]; then
+        echo "ERROR: ANTHROPIC_API_KEY and GITLAB_TOKEN CI/CD variables are required."
+        echo "See demo/gitlab/README.md. Skipping AI autofix."
+        exit 1
+      fi
+    - npm install -g @anthropic-ai/claude-code
+    # Reproduce the failure locally to hand the agent real evidence.
+    - cd src/payment && npm ci && (node charge.test.js > /tmp/fail.log 2>&1 || true) && cd ../..
+    - cat /tmp/fail.log || true
+    # Let the agent edit the repo (acceptEdits keeps it non-interactive) with a
+    # tightly scoped brief. Demo-simple on purpose.
+    - |
+      claude -p --permission-mode acceptEdits "The CI test stage of this repo \
+      failed. Failing test: src/payment/charge.test.js, run with 'node \
+      charge.test.js' after stubbing feature flags off. Captured output:
+
+      $(cat /tmp/fail.log)
+
+      Find the root cause in src/payment/ and apply the SMALLEST possible fix \
+      to the production code (do not change the test). Then briefly explain \
+      the fix." > /tmp/fix-summary.md || { echo 'Claude autofix failed.'; exit 1; }
+    - cat /tmp/fix-summary.md
+    # Verify the agent's fix before proposing it.
+    - cd src/payment && node charge.test.js && cd ../..
+    # Push the fix to a branch and open an MR via git push options.
+    - git config user.email "ai-autofix@demo.local"
+    - git config user.name "Claude Autofix (demo)"
+    - FIX_BRANCH="ai-fix/${CI_COMMIT_SHORT_SHA}"
+    - git checkout -b "${FIX_BRANCH}"
+    - git add -u src/payment
+    - 'git commit -m "Fix payment charge failure found by CI (automated proposal)"'
+    - |
+      git push \
+        -o merge_request.create \
+        -o merge_request.target="${CI_DEFAULT_BRANCH}" \
+        -o merge_request.title="AI autofix: payment charge failure (${CI_COMMIT_SHORT_SHA})" \
+        -o merge_request.description="Automated fix proposal from the ai-autofix CI job. See job log for the agent's explanation. A human reviewer owns the merge decision." \
+        "http://oauth2:${GITLAB_TOKEN}@gitlab:8929/${CI_PROJECT_PATH}.git" \
+        "HEAD:${FIX_BRANCH}"
+    - echo "Fix pushed to ${FIX_BRANCH}; merge request opened for human review."
