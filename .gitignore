@@ -56,5 +56,8 @@ test/tracetesting/tracetesting-vars.yaml
 src/cart/src/Program.cs.bak
 src/flagd/demo.flagd.json.bak
 
+# The working directory of `make generate-kubernetes-manifests`, left behind only if that is killed with SIGKILL
+kubernetes/.generate.*
+
 # Claude Code local settings
 .claude/settings.local.json
