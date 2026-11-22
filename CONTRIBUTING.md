@@ -303,7 +303,8 @@ Maintainers can create a new release when desired by following these steps.
    Charts](https://github.com/open-telemetry/opentelemetry-helm-charts) repo.
    Merge the Pull Request.
 5. After the Helm chart is released, create a new Pull Request which updates the
-   Demo's Kubernetes manifest by running `make generate-kubernetes-manifests`.
+   Demo's Kubernetes manifest: set `DEMO_HELM_CHART_VERSION` in the `Makefile`
+   to the new chart's version, and run `make generate-kubernetes-manifests`.
    Merge the Pull Request.
 
 [docs]: https://opentelemetry.io/docs/demo/

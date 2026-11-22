@@ -27,6 +27,13 @@ endif
 SEMCONVGEN_VERSION=0.11.0
 YAMLLINT_VERSION=1.30.0
 
+# The Helm chart release that kubernetes/opentelemetry-demo.yaml is generated from: the newest one that
+# deploys what the rest of this repository runs. Its appVersion is the IMAGE_VERSION in .env, and its
+# collector, Grafana, and OpenSearch images are the ones in .env too. Later charts move on: 0.40.8 changes
+# those images, and 0.41.0 the demo's release. Without a version, helm renders the newest chart.
+# To list them: helm search repo open-telemetry/opentelemetry-demo --versions
+DEMO_HELM_CHART_VERSION ?= 0.40.7
+
 .PHONY: all
 all: install-tools markdownlint misspell yamllint
 
@@ -159,7 +166,7 @@ generate-kubernetes-manifests:
 	echo "kind: Namespace" >> kubernetes/opentelemetry-demo.yaml
 	echo "metadata:" >> kubernetes/opentelemetry-demo.yaml
 	echo "  name: otel-demo" >> kubernetes/opentelemetry-demo.yaml
-	helm template opentelemetry-demo open-telemetry/opentelemetry-demo --namespace otel-demo | sed '/helm.sh\/chart\:/d' | sed '/helm.sh\/hook/d' | sed '/managed-by\: Helm/d' >> kubernetes/opentelemetry-demo.yaml
+	helm template opentelemetry-demo open-telemetry/opentelemetry-demo --version $(DEMO_HELM_CHART_VERSION) --namespace otel-demo | sed '/helm.sh\/chart\:/d' | sed '/helm.sh\/hook/d' | sed '/managed-by\: Helm/d' >> kubernetes/opentelemetry-demo.yaml
 
 .PHONY: docker-generate-protobuf
 docker-generate-protobuf:
