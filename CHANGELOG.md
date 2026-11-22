@@ -9,6 +9,11 @@ the release.
 
 * [accounting] fix memory leak with dbcontext
   ([#2876](https://github.com/open-telemetry/opentelemetry-demo/pull/2876))
+* [checkout] keep serving when Kafka isn't ready at startup, and keep trying to
+  connect. The service used to crash on the first order, after the payment. The
+  published `2.2.0-checkout` image doesn't have this fix. To get it, build the
+  image from this repository: `make redeploy service=checkout` while the demo
+  runs, or `docker compose build checkout` before you start it.
 
 ## 2.2.0
 

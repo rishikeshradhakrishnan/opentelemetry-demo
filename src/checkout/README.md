@@ -10,6 +10,14 @@ To build the service binary, run:
 go build -o /go/bin/checkout/
 ```
 
+## Test
+
+To run the tests, with the race detector, run:
+
+```sh
+go test -race ./...
+```
+
 ## Docker Build
 
 From the root directory, run:

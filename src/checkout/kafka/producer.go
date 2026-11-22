@@ -5,6 +5,7 @@ package kafka
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/IBM/sarama"
 )
@@ -12,6 +13,8 @@ import (
 var (
 	Topic           = "orders"
 	ProtocolVersion = sarama.V3_0_0_0
+
+	setLoggerOnce sync.Once
 )
 
 type saramaLogger struct {
@@ -29,8 +32,9 @@ func (l *saramaLogger) Print(v ...interface{}) {
 }
 
 func CreateKafkaProducer(brokers []string, logger *slog.Logger) (sarama.AsyncProducer, error) {
-	// Set the logger for sarama to use.
-	sarama.Logger = &saramaLogger{logger: logger}
+	// Set the logger for sarama to use. Only once: it is a package variable that sarama's goroutines
+	// read, and a caller that retries calls this function again while some of them may be running.
+	setLoggerOnce.Do(func() { sarama.Logger = &saramaLogger{logger: logger} })
 
 	saramaConfig := sarama.NewConfig()
 	saramaConfig.Producer.Return.Successes = true
